@@ -18,6 +18,8 @@ const wss = new WebSocket.Server({
   path: "/"
 });
 
+// Middleware to parse JSON bodies
+app.use(express.json());
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 
 // ====================== HTTP ROUTES ======================
@@ -35,7 +37,7 @@ app.get("/", (req, res) => {
   res.json({ status: "running", websocket: true });
 });
 
-// List all active rooms (public)
+// GET all rooms
 app.get("/api/rooms", (req, res) => {
   const roomList = Array.from(rooms.entries()).map(([roomName, clients]) => ({
     room: roomName,
@@ -49,6 +51,38 @@ app.get("/api/rooms", (req, res) => {
   });
 });
 
+// POST: Create a new room via API
+app.post("/api/rooms", (req, res) => {
+  const { room, createdBy } = req.body;
+  let newRoom = room;
+
+  // Auto-generate room name if not provided
+  if (!newRoom) {
+    newRoom = "room-" + Math.random().toString(36).substring(2, 10).toUpperCase();
+  }
+
+  // Check if room already exists
+  if (rooms.has(newRoom)) {
+    return res.status(409).json({
+      success: false,
+      message: "Room already exists",
+      room: newRoom
+    });
+  }
+
+  // Create the room (even if no one is connected yet)
+  rooms.set(newRoom, new Set());
+
+  console.log(`📌 Room created via API: ${newRoom} (by ${createdBy || 'API'})`);
+
+  res.status(201).json({
+    success: true,
+    message: "Room created successfully",
+    room: newRoom,
+    players: 0
+  });
+});
+
 // Protected admin rooms list
 app.get("/api/admin/rooms", (req, res) => {
   const token = req.query.token || req.headers.authorization?.split(" ")[1];
@@ -59,8 +93,7 @@ app.get("/api/admin/rooms", (req, res) => {
 
   const roomList = Array.from(rooms.entries()).map(([roomName, clients]) => ({
     room: roomName,
-    players: clients.size,
-    isEmpty: clients.size === 0
+    players: clients.size
   }));
 
   res.json({
@@ -92,7 +125,7 @@ function broadcastPlayerCount(room) {
 wss.on("connection", (ws, req) => {
   console.log("✅ Client connected");
 
-  // Admin Authentication via query params
+  // Admin Authentication
   const url = new URL(req.url, `http://${req.headers.host}`);
   const isAdminParam = url.searchParams.get("admin") === "true";
   const token = url.searchParams.get("token");
@@ -100,7 +133,6 @@ wss.on("connection", (ws, req) => {
   ws.isAdmin = isAdminParam && token === ADMIN_TOKEN;
   ws.rooms = new Set();
 
-  // Welcome message
   ws.send(JSON.stringify({
     event: "connected",
     message: "Connected successfully",
@@ -112,11 +144,10 @@ wss.on("connection", (ws, req) => {
       const data = JSON.parse(raw.toString());
       const { event, room, userId, message, payload } = data;
 
-      // ---------------- CREATE ROOM ----------------
+      // ---------------- CREATE ROOM (WebSocket) ----------------
       if (event === "create-room") {
         let newRoom = room;
 
-        // Auto generate room code if not provided
         if (!newRoom) {
           newRoom = "room-" + Math.random().toString(36).substring(2, 10).toUpperCase();
         }
@@ -135,7 +166,6 @@ wss.on("connection", (ws, req) => {
         }));
 
         broadcastPlayerCount(newRoom);
-        console.log(`📌 Room created: ${newRoom} (${ws.isAdmin ? 'ADMIN' : 'user'})`);
       }
 
       // ---------------- JOIN ROOM ----------------
@@ -184,14 +214,10 @@ wss.on("connection", (ws, req) => {
         }));
       }
 
-      // ---------------- BROADCAST MESSAGE TO ROOM ----------------
+      // ---------------- BROADCAST MESSAGE ----------------
       else if (room) {
-        // Security check
         if (!ws.isAdmin && !ws.rooms.has(room)) {
-          ws.send(JSON.stringify({
-            event: "error",
-            message: "You are not in this room"
-          }));
+          ws.send(JSON.stringify({ event: "error", message: "You are not in this room" }));
           return;
         }
 
@@ -220,13 +246,11 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  // ---------------- CLEANUP ----------------
   ws.on("close", () => {
     console.log("❌ Client disconnected");
     ws.rooms.forEach(room => {
       const clients = rooms.get(room);
       if (!clients) return;
-
       clients.delete(ws);
       if (clients.size === 0) {
         rooms.delete(room);
@@ -241,5 +265,5 @@ wss.on("connection", (ws, req) => {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 WebSocket: ws://localhost:${PORT}`);
-  console.log(`🔗 Admin URL example: ws://localhost:${PORT}?admin=true&token=${ADMIN_TOKEN}`);
+  console.log(`🔗 Admin URL: ws://localhost:${PORT}?admin=true&token=${ADMIN_TOKEN}`);
 });

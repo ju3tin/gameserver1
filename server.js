@@ -4,10 +4,10 @@ const WebSocket = require("ws");
 
 const app = express();
 const server = http.createServer(app);
-
 const PORT = process.env.PORT || 3000;
 
 const rooms = new Map();
+const wss = new WebSocket.Server({ server });
 
 app.get("/", (req, res) => {
 res.json({
@@ -25,8 +25,6 @@ uptime: process.uptime()
 });
 });
 
-const wss = new WebSocket.Server({ server });
-
 function send(ws, data) {
 if (ws.readyState === WebSocket.OPEN) {
 ws.send(JSON.stringify(data));
@@ -43,9 +41,11 @@ ws.rooms.add(room);
 }
 
 function leaveRoom(ws, room) {
-const clients = rooms.get(room);
+if (!rooms.has(room)) {
+return;
+}
 
-if (!clients) return;
+const clients = rooms.get(room);
 
 clients.delete(ws);
 ws.rooms.delete(room);
@@ -55,24 +55,28 @@ rooms.delete(room);
 }
 }
 
-function broadcast(room, data, exclude = null) {
+function broadcast(room, data, exclude) {
 const clients = rooms.get(room);
 
-if (!clients) return;
+if (!clients) {
+return;
+}
 
 const packet = JSON.stringify(data);
 
-for (const client of clients) {
+clients.forEach((client) => {
 if (
 client !== exclude &&
 client.readyState === WebSocket.OPEN
 ) {
 client.send(packet);
 }
-}
+});
 }
 
 wss.on("connection", (ws) => {
+console.log("Client connected");
+
 ws.rooms = new Set();
 
 send(ws, {
@@ -86,59 +90,76 @@ try {
 const data = JSON.parse(raw.toString());
 
 ```
-  const {
-    event,
-    room,
-    userId,
-    message,
-    payload
-  } = data;
+  const event = data.event;
+  const room = data.room;
+  const userId = data.userId;
+  const message = data.message;
+  const payload = data.payload;
 
-  switch (event) {
-    case "join-room":
-      joinRoom(ws, room);
+  if (event === "join-room") {
+    if (!room) {
+      return;
+    }
 
-      send(ws, {
-        event: "room-joined",
-        message: `Joined ${room}`,
-        payload: { room }
-      });
+    joinRoom(ws, room);
 
-      broadcast(
-        room,
-        {
-          event: "user-joined",
-          message: `${userId} joined`,
-          payload: {
-            room,
-            userId
-          }
-        },
-        ws
-      );
-      break;
+    send(ws, {
+      event: "room-joined",
+      message: "Joined room",
+      payload: {
+        room: room
+      }
+    });
 
-    case "leave-room":
-      leaveRoom(ws, room);
+    broadcast(
+      room,
+      {
+        event: "user-joined",
+        message: "User joined room",
+        payload: {
+          room: room,
+          userId: userId
+        }
+      },
+      ws
+    );
 
-      send(ws, {
-        event: "room-left",
-        message: `Left ${room}`,
-        payload: { room }
-      });
-      break;
-
-    default:
-      broadcast(room, {
-        event,
-        room,
-        userId,
-        message: message || null,
-        payload: payload || null,
-        timestamp: Date.now()
-      });
+    return;
   }
-} catch {
+
+  if (event === "leave-room") {
+    if (!room) {
+      return;
+    }
+
+    leaveRoom(ws, room);
+
+    send(ws, {
+      event: "room-left",
+      message: "Left room",
+      payload: {
+        room: room
+      }
+    });
+
+    return;
+  }
+
+  if (!room) {
+    return;
+  }
+
+  broadcast(room, {
+    event: event,
+    room: room,
+    userId: userId || null,
+    message: message || null,
+    payload: payload || null,
+    timestamp: Date.now()
+  });
+} catch (error) {
+  console.error(error);
+
   send(ws, {
     event: "error",
     message: "Invalid JSON",
@@ -150,12 +171,21 @@ const data = JSON.parse(raw.toString());
 });
 
 ws.on("close", () => {
-for (const room of ws.rooms) {
+ws.rooms.forEach((room) => {
 leaveRoom(ws, room);
-}
+});
+
+```
+console.log("Client disconnected");
+```
+
+});
+
+ws.on("error", (error) => {
+console.error(error);
 });
 });
 
 server.listen(PORT, () => {
-console.log(`Server listening on port ${PORT}`);
+console.log("Server listening on port " + PORT);
 });

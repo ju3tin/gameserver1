@@ -7,11 +7,11 @@ const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
-// room -> Set of clients
-const rooms = new Map();
+// Admin secret - CHANGE THIS IN PRODUCTION!
+const ADMIN_TOKEN = "your-super-secret-admin-token";
 
-// Admin secret (change this in production!)
-const ADMIN_TOKEN = "your-super-secret-admin-token"; // ← CHANGE THIS
+// room -> Set of WebSocket clients
+const rooms = new Map();
 
 const wss = new WebSocket.Server({
   server,
@@ -20,7 +20,8 @@ const wss = new WebSocket.Server({
 
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 
-// Health check
+// ====================== HTTP ROUTES ======================
+
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -34,7 +35,42 @@ app.get("/", (req, res) => {
   res.json({ status: "running", websocket: true });
 });
 
-// -------------------- HELPERS --------------------
+// List all active rooms (public)
+app.get("/api/rooms", (req, res) => {
+  const roomList = Array.from(rooms.entries()).map(([roomName, clients]) => ({
+    room: roomName,
+    players: clients.size
+  }));
+
+  res.json({
+    success: true,
+    totalRooms: roomList.length,
+    rooms: roomList
+  });
+});
+
+// Protected admin rooms list
+app.get("/api/admin/rooms", (req, res) => {
+  const token = req.query.token || req.headers.authorization?.split(" ")[1];
+
+  if (token !== ADMIN_TOKEN) {
+    return res.status(403).json({ success: false, message: "Unauthorized" });
+  }
+
+  const roomList = Array.from(rooms.entries()).map(([roomName, clients]) => ({
+    room: roomName,
+    players: clients.size,
+    isEmpty: clients.size === 0
+  }));
+
+  res.json({
+    success: true,
+    totalRooms: roomList.length,
+    rooms: roomList
+  });
+});
+
+// ====================== HELPERS ======================
 function broadcastPlayerCount(room) {
   const clients = rooms.get(room);
   if (!clients) return;
@@ -52,11 +88,11 @@ function broadcastPlayerCount(room) {
   });
 }
 
-// -------------------- WEBSOCKET --------------------
+// ====================== WEBSOCKET ======================
 wss.on("connection", (ws, req) => {
   console.log("✅ Client connected");
 
-  // === ADMIN AUTHENTICATION ===
+  // Admin Authentication via query params
   const url = new URL(req.url, `http://${req.headers.host}`);
   const isAdminParam = url.searchParams.get("admin") === "true";
   const token = url.searchParams.get("token");
@@ -64,6 +100,7 @@ wss.on("connection", (ws, req) => {
   ws.isAdmin = isAdminParam && token === ADMIN_TOKEN;
   ws.rooms = new Set();
 
+  // Welcome message
   ws.send(JSON.stringify({
     event: "connected",
     message: "Connected successfully",
@@ -75,14 +112,30 @@ wss.on("connection", (ws, req) => {
       const data = JSON.parse(raw.toString());
       const { event, room, userId, message, payload } = data;
 
-      // ---------------- CREATE GAME ----------------
-      if (event === "create-game" && room) {
-        if (!rooms.has(room)) rooms.set(room, new Set());
-        rooms.get(room).add(ws);
-        ws.rooms.add(room);
+      // ---------------- CREATE ROOM ----------------
+      if (event === "create-room") {
+        let newRoom = room;
 
-        ws.send(JSON.stringify({ event: "game-created", room }));
-        broadcastPlayerCount(room);
+        // Auto generate room code if not provided
+        if (!newRoom) {
+          newRoom = "room-" + Math.random().toString(36).substring(2, 10).toUpperCase();
+        }
+
+        if (!rooms.has(newRoom)) {
+          rooms.set(newRoom, new Set());
+        }
+
+        rooms.get(newRoom).add(ws);
+        ws.rooms.add(newRoom);
+
+        ws.send(JSON.stringify({
+          event: "room-created",
+          room: newRoom,
+          isAdmin: ws.isAdmin
+        }));
+
+        broadcastPlayerCount(newRoom);
+        console.log(`📌 Room created: ${newRoom} (${ws.isAdmin ? 'ADMIN' : 'user'})`);
       }
 
       // ---------------- JOIN ROOM ----------------
@@ -117,9 +170,23 @@ wss.on("connection", (ws, req) => {
         }
       }
 
-      // ---------------- ROOM MESSAGES ----------------
+      // ---------------- ADMIN: GET ALL ROOMS ----------------
+      else if (event === "admin:get-rooms" && ws.isAdmin) {
+        const roomList = Array.from(rooms.entries()).map(([roomName, clients]) => ({
+          room: roomName,
+          players: clients.size
+        }));
+
+        ws.send(JSON.stringify({
+          event: "admin:rooms-list",
+          total: roomList.length,
+          rooms: roomList
+        }));
+      }
+
+      // ---------------- BROADCAST MESSAGE TO ROOM ----------------
       else if (room) {
-        // Security: Normal users must be in the room
+        // Security check
         if (!ws.isAdmin && !ws.rooms.has(room)) {
           ws.send(JSON.stringify({
             event: "error",
@@ -149,15 +216,17 @@ wss.on("connection", (ws, req) => {
       }
     } catch (err) {
       console.error("Message error:", err);
+      ws.send(JSON.stringify({ event: "error", message: "Invalid message format" }));
     }
   });
 
-  // ---------------- CLEANUP ON DISCONNECT ----------------
+  // ---------------- CLEANUP ----------------
   ws.on("close", () => {
     console.log("❌ Client disconnected");
     ws.rooms.forEach(room => {
       const clients = rooms.get(room);
       if (!clients) return;
+
       clients.delete(ws);
       if (clients.size === 0) {
         rooms.delete(room);
@@ -168,7 +237,9 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-// -------------------- START SERVER --------------------
+// Start Server
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📡 WebSocket: ws://localhost:${PORT}`);
+  console.log(`🔗 Admin URL example: ws://localhost:${PORT}?admin=true&token=${ADMIN_TOKEN}`);
 });

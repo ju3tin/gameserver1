@@ -9,19 +9,20 @@ const PORT = process.env.PORT || 3000;
 
 const ADMIN_TOKEN = "your-super-secret-admin-token";
 
-const rooms = new Map();
+const rooms = new Map(); // gameId -> roomData
 
 const wss = new WebSocket.Server({ server, path: "/" });
 
 app.use(express.json());
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 
-// HTTP Routes
-app.get("/health", (req, res) => res.json({ status: "ok", rooms: rooms.size }));
+// ====================== HTTP ======================
+app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 app.get("/api/rooms", (req, res) => {
-  const list = Array.from(rooms.entries()).map(([name, data]) => ({
-    room: name,
+  const list = Array.from(rooms.entries()).map(([gameId, data]) => ({
+    gameId,
+    room: data.room,
     players: data.players.size,
     maxPlayers: data.maxPlayers,
     status: data.status
@@ -29,160 +30,167 @@ app.get("/api/rooms", (req, res) => {
   res.json({ success: true, rooms: list });
 });
 
-// ====================== HELPERS ======================
-function broadcastToRoom(room, event, data = {}) {
-  const roomData = rooms.get(room);
-  if (!roomData) return;
-
-  const packet = JSON.stringify({ event, room, ...data, timestamp: Date.now() });
-  roomData.players.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) client.send(packet);
-  });
-}
-
 // ====================== WEBSOCKET ======================
 wss.on("connection", (ws, req) => {
   console.log("✅ Client connected");
 
-  // Admin check
+  ws.userId = null;
+  ws.currentGameId = null;
+  ws.isAdmin = false;
+
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     ws.isAdmin = url.searchParams.get("admin") === "true" && 
                  url.searchParams.get("token") === ADMIN_TOKEN;
-  } catch (e) {
-    ws.isAdmin = false;
-  }
-
-  ws.currentRoom = null;
+  } catch (e) {}
 
   ws.send(JSON.stringify({ event: "connected", isAdmin: ws.isAdmin }));
 
   ws.on("message", (raw) => {
     try {
       const data = JSON.parse(raw.toString());
-      const { event, room, maxPlayers } = data;
+      const { event, gameId, room, userId, maxPlayers, message } = data;
 
-      console.log(`📨 ${event} | Room: ${room || ws.currentRoom}`);
+      // Set User ID
+      if (userId) ws.userId = userId;
 
-      // CREATE ROOM
+      // CREATE ROOM / GAME
       if (event === "create-room") {
-        let newRoom = room || "room-" + Math.random().toString(36).substring(2, 10).toUpperCase();
-        const maxP = parseInt(maxPlayers) || 4;
+        const newGameId = gameId || "game-" + Math.random().toString(36).substring(2, 10).toUpperCase();
+        const newRoom = room || newGameId;
 
-        if (rooms.has(newRoom)) {
-          return ws.send(JSON.stringify({ event: "error", message: "Room already exists" }));
+        if (rooms.has(newGameId)) {
+          return ws.send(JSON.stringify({ event: "error", message: "Game ID already exists" }));
         }
 
-        rooms.set(newRoom, {
-          maxPlayers: maxP,
+        rooms.set(newGameId, {
+          gameId: newGameId,
+          room: newRoom,
+          maxPlayers: parseInt(maxPlayers) || 4,
           players: new Set([ws]),
           readyPlayers: new Set(),
           status: "waiting"
         });
 
-        ws.currentRoom = newRoom;
+        ws.currentGameId = newGameId;
+        ws.userId = ws.userId || "Host";
 
-        ws.send(JSON.stringify({ event: "room-created", room: newRoom, maxPlayers: maxP, players: 1 }));
-        broadcastToRoom(newRoom, "player-joined", { players: 1, maxPlayers: maxP });
-      }
-
-      // JOIN ROOM - FIXED
-      else if (event === "join-room" && room) {
-        const roomData = rooms.get(room);
-        if (!roomData) {
-          return ws.send(JSON.stringify({ event: "error", message: "Room not found" }));
-        }
-        if (roomData.players.size >= roomData.maxPlayers) {
-          return ws.send(JSON.stringify({ event: "error", message: "Room is full" }));
-        }
-        if (roomData.status === "playing") {
-          return ws.send(JSON.stringify({ event: "error", message: "Game already started" }));
-        }
-
-        roomData.players.add(ws);
-        ws.currentRoom = room;
-
-        ws.send(JSON.stringify({ 
-          event: "room-joined", 
-          room, 
-          players: roomData.players.size, 
-          maxPlayers: roomData.maxPlayers 
+        ws.send(JSON.stringify({
+          event: "room-created",
+          gameId: newGameId,
+          room: newRoom,
+          maxPlayers: parseInt(maxPlayers) || 4,
+          userId: ws.userId
         }));
 
-        broadcastToRoom(room, "player-joined", { 
-          players: roomData.players.size, 
-          maxPlayers: roomData.maxPlayers 
+        broadcastToRoom(newGameId, "player-joined", {
+          players: 1,
+          maxPlayers: parseInt(maxPlayers) || 4,
+          userId: ws.userId
+        });
+      }
+
+      // JOIN GAME
+      else if (event === "join-room" && gameId) {
+        const gameData = rooms.get(gameId);
+        if (!gameData) return ws.send(JSON.stringify({ event: "error", message: "Game not found" }));
+        if (gameData.players.size >= gameData.maxPlayers) {
+          return ws.send(JSON.stringify({ event: "error", message: "Game is full" }));
+        }
+
+        gameData.players.add(ws);
+        ws.currentGameId = gameId;
+        ws.userId = ws.userId || `Player${gameData.players.size}`;
+
+        ws.send(JSON.stringify({
+          event: "room-joined",
+          gameId,
+          room: gameData.room,
+          players: gameData.players.size,
+          maxPlayers: gameData.maxPlayers,
+          userId: ws.userId
+        }));
+
+        broadcastToRoom(gameId, "player-joined", {
+          players: gameData.players.size,
+          maxPlayers: gameData.maxPlayers,
+          userId: ws.userId
         });
       }
 
       // READY
-      else if (event === "ready" && ws.currentRoom) {
-        const roomData = rooms.get(ws.currentRoom);
-        if (!roomData) return;
+      else if (event === "ready" && ws.currentGameId) {
+        const gameData = rooms.get(ws.currentGameId);
+        if (!gameData) return;
 
-        roomData.readyPlayers.add(ws);
+        gameData.readyPlayers.add(ws);
 
-        const isAllReady = roomData.readyPlayers.size === roomData.players.size && roomData.players.size >= 2;
+        const isAllReady = gameData.readyPlayers.size === gameData.players.size && gameData.players.size >= 2;
 
-        broadcastToRoom(ws.currentRoom, "ready-update", {
-          readyCount: roomData.readyPlayers.size,
-          totalPlayers: roomData.players.size,
+        broadcastToRoom(ws.currentGameId, "ready-update", {
+          readyCount: gameData.readyPlayers.size,
+          totalPlayers: gameData.players.size,
           allReady: isAllReady
         });
 
-        if (isAllReady) {
-          // Start countdown
-          let timeLeft = 5;
-          roomData.status = "countdown";
-          broadcastToRoom(ws.currentRoom, "countdown", { timeLeft });
-
-          const interval = setInterval(() => {
-            timeLeft--;
-            broadcastToRoom(ws.currentRoom, "countdown", { timeLeft });
-
-            if (timeLeft <= 0) {
-              clearInterval(interval);
-              roomData.status = "playing";
-              broadcastToRoom(ws.currentRoom, "game-start", { message: "Game Started!" });
-            }
-          }, 1000);
-        }
+        if (isAllReady) startCountdown(ws.currentGameId);
       }
 
-      // CHAT MESSAGE
-      else if (event === "chat" && (room || ws.currentRoom)) {
-        const targetRoom = room || ws.currentRoom;
-        const roomData = rooms.get(targetRoom);
-        if (roomData && roomData.players.has(ws)) {
-          broadcastToRoom(targetRoom, "chat", {
-            userId: ws.isAdmin ? "ADMIN" : "Player",
-            message: data.message,
-            fromAdmin: ws.isAdmin
-          });
-        }
+      // CHAT
+      else if (event === "chat" && ws.currentGameId) {
+        broadcastToRoom(ws.currentGameId, "chat", {
+          userId: ws.userId || "Unknown",
+          message,
+          fromAdmin: ws.isAdmin
+        });
       }
-
     } catch (err) {
-      console.error("Error:", err);
+      console.error(err);
     }
   });
 
   ws.on("close", () => {
-    if (ws.currentRoom) {
-      const roomData = rooms.get(ws.currentRoom);
-      if (roomData) {
-        roomData.players.delete(ws);
-        roomData.readyPlayers.delete(ws);
-
-        if (roomData.players.size === 0) {
-          rooms.delete(ws.currentRoom);
-        } else {
-          broadcastToRoom(ws.currentRoom, "player-left", { players: roomData.players.size });
-        }
+    if (ws.currentGameId) {
+      const gameData = rooms.get(ws.currentGameId);
+      if (gameData) {
+        gameData.players.delete(ws);
+        gameData.readyPlayers.delete(ws);
+        if (gameData.players.size === 0) rooms.delete(ws.currentGameId);
+        else broadcastToRoom(ws.currentGameId, "player-left", { players: gameData.players.size });
       }
     }
   });
 });
+
+function broadcastToRoom(gameId, event, data = {}) {
+  const gameData = rooms.get(gameId);
+  if (!gameData) return;
+
+  const packet = JSON.stringify({ event, gameId, ...data, timestamp: Date.now() });
+  gameData.players.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) client.send(packet);
+  });
+}
+
+function startCountdown(gameId) {
+  const gameData = rooms.get(gameId);
+  if (!gameData) return;
+
+  gameData.status = "countdown";
+  let timeLeft = 5;
+
+  broadcastToRoom(gameId, "countdown", { timeLeft });
+
+  const interval = setInterval(() => {
+    timeLeft--;
+    broadcastToRoom(gameId, "countdown", { timeLeft });
+    if (timeLeft <= 0) {
+      clearInterval(interval);
+      gameData.status = "playing";
+      broadcastToRoom(gameId, "game-start", { message: "Game Started!" });
+    }
+  }, 1000);
+}
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);

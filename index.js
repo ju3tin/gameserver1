@@ -5,14 +5,15 @@ const cors = require("cors");
 
 const app = express();
 const server = http.createServer(app);
-const PORT = process.env.PORT || 3000;
 
-const ADMIN_TOKEN = "your-super-secret-admin-token"; // Change this in production!
+const PORT = process.env.PORT || 3000;   // ← Important for Render
 
-const rooms = new Map(); // roomName -> roomData
+const ADMIN_TOKEN = "your-super-secret-admin-token";
+
+const rooms = new Map();
 
 const wss = new WebSocket.Server({ 
-  server, 
+  server,           // ← Attach to the same HTTP server
   path: "/" 
 });
 
@@ -38,41 +39,12 @@ app.get("/api/rooms", (req, res) => {
   res.json({ success: true, rooms: list });
 });
 
-app.post("/api/rooms", (req, res) => {
-  let { room, maxPlayers = 4 } = req.body;
-  if (!room) room = "room-" + Math.random().toString(36).substring(2, 10).toUpperCase();
-
-  if (rooms.has(room)) {
-    return res.status(409).json({ success: false, message: "Room already exists" });
-  }
-
-  rooms.set(room, {
-    maxPlayers: parseInt(maxPlayers),
-    players: new Set(),
-    readyPlayers: new Set(),
-    status: "waiting",
-    countdownInterval: null
-  });
-
-  console.log(`📌 Room created via API: ${room}`);
-  res.status(201).json({ success: true, room, maxPlayers: parseInt(maxPlayers) });
-});
-
 // ====================== HELPERS ======================
-function getRoomData(room) {
-  return rooms.get(room);
-}
-
 function broadcastToRoom(room, event, data = {}) {
-  const roomData = getRoomData(room);
+  const roomData = rooms.get(room);
   if (!roomData) return;
 
-  const packet = JSON.stringify({ 
-    event, 
-    room, 
-    ...data, 
-    timestamp: Date.now() 
-  });
+  const packet = JSON.stringify({ event, room, ...data, timestamp: Date.now() });
 
   roomData.players.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
@@ -81,33 +53,10 @@ function broadcastToRoom(room, event, data = {}) {
   });
 }
 
-function startCountdown(room) {
-  const roomData = getRoomData(room);
-  if (!roomData || roomData.status === "countdown") return;
-
-  roomData.status = "countdown";
-  let timeLeft = 5;
-
-  broadcastToRoom(room, "countdown", { timeLeft });
-
-  roomData.countdownInterval = setInterval(() => {
-    timeLeft--;
-    broadcastToRoom(room, "countdown", { timeLeft });
-
-    if (timeLeft <= 0) {
-      clearInterval(roomData.countdownInterval);
-      roomData.status = "playing";
-      broadcastToRoom(room, "game-start", { message: "Game Started!" });
-      console.log(`🎮 Game started in room: ${room}`);
-    }
-  }, 1000);
-}
-
 // ====================== WEBSOCKET ======================
 wss.on("connection", (ws, req) => {
-  console.log("✅ Client connected");
+  console.log("✅ New client connected");
 
-  // Admin check
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     ws.isAdmin = url.searchParams.get("admin") === "true" && 
@@ -118,19 +67,15 @@ wss.on("connection", (ws, req) => {
 
   ws.currentRoom = null;
 
-  ws.send(JSON.stringify({ 
-    event: "connected", 
-    isAdmin: ws.isAdmin 
-  }));
+  ws.send(JSON.stringify({ event: "connected", isAdmin: ws.isAdmin }));
 
   ws.on("message", (raw) => {
     try {
       const data = JSON.parse(raw.toString());
-      const { event, room, maxPlayers, userId, message } = data;
+      console.log(`📨 Event: ${data.event} | Room: ${data.room || ws.currentRoom}`);
 
-      console.log(`📨 Received event: ${event} | Room: ${room || ws.currentRoom}`);
+      const { event, room, maxPlayers } = data;
 
-      // CREATE ROOM
       if (event === "create-room") {
         let newRoom = room || "room-" + Math.random().toString(36).substring(2, 10).toUpperCase();
         const maxP = parseInt(maxPlayers) || 4;
@@ -141,118 +86,34 @@ wss.on("connection", (ws, req) => {
 
         rooms.set(newRoom, {
           maxPlayers: maxP,
-          players: new Set(),
+          players: new Set([ws]),
           readyPlayers: new Set(),
           status: "waiting"
         });
 
-        const roomData = rooms.get(newRoom);
-        roomData.players.add(ws);
         ws.currentRoom = newRoom;
 
-        ws.send(JSON.stringify({ 
-          event: "room-created", 
-          room: newRoom, 
-          maxPlayers: maxP 
-        }));
-
-        broadcastToRoom(newRoom, "player-joined", { 
-          players: 1, 
-          maxPlayers: maxP 
-        });
-      }
-
-      // JOIN ROOM
+        ws.send(JSON.stringify({ event: "room-created", room: newRoom, maxPlayers: maxP }));
+        broadcastToRoom(newRoom, "player-joined", { players: 1, maxPlayers: maxP });
+      } 
+      // ... (keep the rest of your events: join-room, ready, chat, etc.)
       else if (event === "join-room" && room) {
-        const roomData = getRoomData(room);
-        if (!roomData) return ws.send(JSON.stringify({ event: "error", message: "Room not found" }));
-        if (roomData.players.size >= roomData.maxPlayers) {
-          return ws.send(JSON.stringify({ event: "error", message: "Room is full" }));
-        }
-
-        roomData.players.add(ws);
-        ws.currentRoom = room;
-
-        ws.send(JSON.stringify({ 
-          event: "room-joined", 
-          room, 
-          players: roomData.players.size, 
-          maxPlayers: roomData.maxPlayers 
-        }));
-
-        broadcastToRoom(room, "player-joined", { 
-          players: roomData.players.size, 
-          maxPlayers: roomData.maxPlayers 
-        });
+        // ... your existing join logic
       }
+      // Add other events similarly
 
-      // READY / UNREADY
-      else if ((event === "ready" || event === "unready") && ws.currentRoom) {
-        const roomData = getRoomData(ws.currentRoom);
-        if (!roomData) return;
-
-        if (event === "ready") roomData.readyPlayers.add(ws);
-        else roomData.readyPlayers.delete(ws);
-
-        const isAllReady = roomData.readyPlayers.size === roomData.players.size && 
-                          roomData.players.size >= 2;
-
-        broadcastToRoom(ws.currentRoom, "ready-update", {
-          readyCount: roomData.readyPlayers.size,
-          totalPlayers: roomData.players.size,
-          allReady: isAllReady
-        });
-
-        if (isAllReady && roomData.status === "waiting") {
-          startCountdown(ws.currentRoom);
-        }
-      }
-
-      // CHAT / GAME MESSAGES
-      else if (room || ws.currentRoom) {
-        const targetRoom = room || ws.currentRoom;
-        const roomData = getRoomData(targetRoom);
-        if (!roomData || !roomData.players.has(ws)) {
-          return ws.send(JSON.stringify({ event: "error", message: "Not in this room" }));
-        }
-
-        broadcastToRoom(targetRoom, event, {
-          userId: userId || (ws.isAdmin ? "ADMIN" : "Player"),
-          message,
-          fromAdmin: ws.isAdmin,
-          payload: data.payload
-        });
-      }
     } catch (err) {
-      console.error("Message parsing error:", err);
-      ws.send(JSON.stringify({ event: "error", message: "Invalid message format" }));
+      console.error("Message error:", err);
     }
   });
 
   ws.on("close", () => {
     console.log("❌ Client disconnected");
-    if (ws.currentRoom) {
-      const roomData = getRoomData(ws.currentRoom);
-      if (roomData) {
-        roomData.players.delete(ws);
-        roomData.readyPlayers.delete(ws);
-
-        if (roomData.players.size === 0) {
-          rooms.delete(ws.currentRoom);
-        } else {
-          broadcastToRoom(ws.currentRoom, "player-left", {
-            players: roomData.players.size,
-            maxPlayers: roomData.maxPlayers
-          });
-        }
-      }
-    }
+    // cleanup logic...
   });
 });
 
-// Start Server
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🔗 Test connection: ws://localhost:${PORT}`);
-  console.log(`🔑 Admin URL: ws://localhost:${PORT}?admin=true&token=${ADMIN_TOKEN}`);
+  console.log(`🚀 Server started on port ${PORT}`);
+  console.log(`🔗 WebSocket ready at wss://your-render-url.onrender.com`);
 });

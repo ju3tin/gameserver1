@@ -5,29 +5,19 @@ const cors = require("cors");
 
 const app = express();
 const server = http.createServer(app);
-
-const PORT = process.env.PORT || 3000;   // ← Important for Render
+const PORT = process.env.PORT || 3000;
 
 const ADMIN_TOKEN = "your-super-secret-admin-token";
 
 const rooms = new Map();
 
-const wss = new WebSocket.Server({ 
-  server,           // ← Attach to the same HTTP server
-  path: "/" 
-});
+const wss = new WebSocket.Server({ server, path: "/" });
 
 app.use(express.json());
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }));
 
-// ====================== HTTP ROUTES ======================
-app.get("/health", (req, res) => {
-  res.json({ 
-    status: "ok", 
-    rooms: rooms.size,
-    connections: wss.clients.size 
-  });
-});
+// HTTP Routes
+app.get("/health", (req, res) => res.json({ status: "ok", rooms: rooms.size }));
 
 app.get("/api/rooms", (req, res) => {
   const list = Array.from(rooms.entries()).map(([name, data]) => ({
@@ -45,18 +35,16 @@ function broadcastToRoom(room, event, data = {}) {
   if (!roomData) return;
 
   const packet = JSON.stringify({ event, room, ...data, timestamp: Date.now() });
-
   roomData.players.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(packet);
-    }
+    if (client.readyState === WebSocket.OPEN) client.send(packet);
   });
 }
 
 // ====================== WEBSOCKET ======================
 wss.on("connection", (ws, req) => {
-  console.log("✅ New client connected");
+  console.log("✅ Client connected");
 
+  // Admin check
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     ws.isAdmin = url.searchParams.get("admin") === "true" && 
@@ -72,10 +60,11 @@ wss.on("connection", (ws, req) => {
   ws.on("message", (raw) => {
     try {
       const data = JSON.parse(raw.toString());
-      console.log(`📨 Event: ${data.event} | Room: ${data.room || ws.currentRoom}`);
-
       const { event, room, maxPlayers } = data;
 
+      console.log(`📨 ${event} | Room: ${room || ws.currentRoom}`);
+
+      // CREATE ROOM
       if (event === "create-room") {
         let newRoom = room || "room-" + Math.random().toString(36).substring(2, 10).toUpperCase();
         const maxP = parseInt(maxPlayers) || 4;
@@ -93,27 +82,108 @@ wss.on("connection", (ws, req) => {
 
         ws.currentRoom = newRoom;
 
-        ws.send(JSON.stringify({ event: "room-created", room: newRoom, maxPlayers: maxP }));
+        ws.send(JSON.stringify({ event: "room-created", room: newRoom, maxPlayers: maxP, players: 1 }));
         broadcastToRoom(newRoom, "player-joined", { players: 1, maxPlayers: maxP });
-      } 
-      // ... (keep the rest of your events: join-room, ready, chat, etc.)
-      else if (event === "join-room" && room) {
-        // ... your existing join logic
       }
-      // Add other events similarly
+
+      // JOIN ROOM - FIXED
+      else if (event === "join-room" && room) {
+        const roomData = rooms.get(room);
+        if (!roomData) {
+          return ws.send(JSON.stringify({ event: "error", message: "Room not found" }));
+        }
+        if (roomData.players.size >= roomData.maxPlayers) {
+          return ws.send(JSON.stringify({ event: "error", message: "Room is full" }));
+        }
+        if (roomData.status === "playing") {
+          return ws.send(JSON.stringify({ event: "error", message: "Game already started" }));
+        }
+
+        roomData.players.add(ws);
+        ws.currentRoom = room;
+
+        ws.send(JSON.stringify({ 
+          event: "room-joined", 
+          room, 
+          players: roomData.players.size, 
+          maxPlayers: roomData.maxPlayers 
+        }));
+
+        broadcastToRoom(room, "player-joined", { 
+          players: roomData.players.size, 
+          maxPlayers: roomData.maxPlayers 
+        });
+      }
+
+      // READY
+      else if (event === "ready" && ws.currentRoom) {
+        const roomData = rooms.get(ws.currentRoom);
+        if (!roomData) return;
+
+        roomData.readyPlayers.add(ws);
+
+        const isAllReady = roomData.readyPlayers.size === roomData.players.size && roomData.players.size >= 2;
+
+        broadcastToRoom(ws.currentRoom, "ready-update", {
+          readyCount: roomData.readyPlayers.size,
+          totalPlayers: roomData.players.size,
+          allReady: isAllReady
+        });
+
+        if (isAllReady) {
+          // Start countdown
+          let timeLeft = 5;
+          roomData.status = "countdown";
+          broadcastToRoom(ws.currentRoom, "countdown", { timeLeft });
+
+          const interval = setInterval(() => {
+            timeLeft--;
+            broadcastToRoom(ws.currentRoom, "countdown", { timeLeft });
+
+            if (timeLeft <= 0) {
+              clearInterval(interval);
+              roomData.status = "playing";
+              broadcastToRoom(ws.currentRoom, "game-start", { message: "Game Started!" });
+            }
+          }, 1000);
+        }
+      }
+
+      // CHAT MESSAGE
+      else if (event === "chat" && (room || ws.currentRoom)) {
+        const targetRoom = room || ws.currentRoom;
+        const roomData = rooms.get(targetRoom);
+        if (roomData && roomData.players.has(ws)) {
+          broadcastToRoom(targetRoom, "chat", {
+            userId: ws.isAdmin ? "ADMIN" : "Player",
+            message: data.message,
+            fromAdmin: ws.isAdmin
+          });
+        }
+      }
 
     } catch (err) {
-      console.error("Message error:", err);
+      console.error("Error:", err);
     }
   });
 
   ws.on("close", () => {
-    console.log("❌ Client disconnected");
-    // cleanup logic...
+    if (ws.currentRoom) {
+      const roomData = rooms.get(ws.currentRoom);
+      if (roomData) {
+        roomData.players.delete(ws);
+        roomData.readyPlayers.delete(ws);
+
+        if (roomData.players.size === 0) {
+          rooms.delete(ws.currentRoom);
+        } else {
+          broadcastToRoom(ws.currentRoom, "player-left", { players: roomData.players.size });
+        }
+      }
+    }
   });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server started on port ${PORT}`);
-  console.log(`🔗 WebSocket ready at wss://your-render-url.onrender.com`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
